@@ -1,0 +1,211 @@
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.transforms.functional import to_pil_image
+from PIL import Image
+import os
+
+# UNet model definition
+class UNet(torch.nn.Module):
+    def __init__(self, in_channels=3, out_channels=2):
+        super(UNet, self).__init__()
+
+        def double_conv(in_ch, out_ch):
+            return torch.nn.Sequential(
+                torch.nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+                torch.nn.ReLU(inplace=True),
+                torch.nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+                torch.nn.ReLU(inplace=True),
+            )
+
+        # Encoder
+        self.encoder1 = double_conv(in_channels, 64)
+        self.pool1 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.encoder2 = double_conv(64, 128)
+        self.pool2 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.encoder3 = double_conv(128, 256)
+        self.pool3 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.encoder4 = double_conv(256, 512)
+        self.pool4 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Bottleneck
+        self.bottleneck = double_conv(512, 1024)
+
+        # Decoder
+        self.upconv4 = torch.nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.decoder4 = double_conv(1024, 512)
+
+        self.upconv3 = torch.nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.decoder3 = double_conv(512, 256)
+
+        self.upconv2 = torch.nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.decoder2 = double_conv(256, 128)
+
+        self.upconv1 = torch.nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.decoder1 = double_conv(128, 64)
+
+        # Output layer
+        self.output = torch.nn.Conv2d(64, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder
+        enc1 = self.encoder1(x)
+        enc2 = self.encoder2(self.pool1(enc1))
+        enc3 = self.encoder3(self.pool2(enc2))
+        enc4 = self.encoder4(self.pool3(enc3))
+
+        # Bottleneck
+        bottleneck = self.bottleneck(self.pool4(enc4))
+
+        # Decoder
+        dec4 = self.upconv4(bottleneck)
+        dec4 = self.decoder4(torch.cat((dec4, enc4), dim=1))
+
+        dec3 = self.upconv3(dec4)
+        dec3 = self.decoder3(torch.cat((dec3, enc3), dim=1))
+
+        dec2 = self.upconv2(dec3)
+        dec2 = self.decoder2(torch.cat((dec2, enc2), dim=1))
+
+        dec1 = self.upconv1(dec2)
+        dec1 = self.decoder1(torch.cat((dec1, enc1), dim=1))
+
+        # Output
+        x = self.output(dec1)
+
+        # Resize output to match the target mask size (256x256)
+        x = torch.nn.functional.interpolate(x, size=(256, 256), mode="bilinear", align_corners=False)
+        return x
+
+
+# MIoU Calculation
+def calculate_miou(preds, masks, num_classes):
+    preds = torch.argmax(preds, dim=1)  # Get class predictions
+    iou_per_class = []
+
+    for cls in range(num_classes):
+        intersection = ((preds == cls) & (masks == cls)).sum().item()
+        union = ((preds == cls) | (masks == cls)).sum().item()
+
+        if union > 0:
+            iou_per_class.append(intersection / union)
+        else:
+            iou_per_class.append(0)
+
+    return sum(iou_per_class) / len(iou_per_class)
+
+
+# Custom dataset loader
+class CustomSegmentationDataset(Dataset):
+    def __init__(self, image_dir, mask_dir, transform=None):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.transform = transform
+        self.images = os.listdir(image_dir)
+        assert os.path.exists(image_dir), f"Image directory not found: {image_dir}"
+        assert os.path.exists(mask_dir), f"Mask directory not found: {mask_dir}"
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.image_dir, self.images[idx])
+        mask_path = os.path.join(self.mask_dir, self.images[idx])
+
+        image = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+
+        if self.transform:
+            image = self.transform(image)
+            mask = transforms.Resize((256, 256))(mask)
+            mask = transforms.ToTensor()(mask)
+
+        return image, mask
+
+
+# Dataset and DataLoader setup
+transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+])
+
+dataset = CustomSegmentationDataset(
+    image_dir='/content/gdrive/MyDrive/Cityscapes/PatchGen/Bochum',
+    mask_dir='/content/gdrive/MyDrive/Cityscapes/PatchGen/Bochum',
+    transform=transform
+)
+dataloader = DataLoader(dataset, batch_size=4, shuffle=False)
+
+# Model instantiation
+model = UNet(in_channels=3, out_channels=2)
+criterion = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+
+# Directory to save results
+results_dir = '/content/gdrive/MyDrive/Cityscapes/Results/'
+os.makedirs(results_dir, exist_ok=True)  # Create results directory if it doesn't exist
+
+# Training loop with MIoU calculation
+epochs = 10
+num_classes = 2
+
+for epoch in range(epochs):
+    model.train()
+    total_loss = 0
+    total_miou = 0
+    num_batches = 0
+
+    for batch_idx, (images, masks) in enumerate(dataloader):
+        optimizer.zero_grad()
+        outputs = model(images)
+        masks = masks.squeeze(1)  # Remove channel dimension from masks
+        loss = criterion(outputs, masks.long())
+        error = -loss
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_miou += calculate_miou(outputs, masks, num_classes)
+        num_batches += 1
+
+    avg_loss = total_loss / num_batches
+    avg_miou = total_miou / num_batches
+
+    print(f"Epoch {epoch + 1}, Loss: {avg_loss:.4f}, MIoU: {avg_miou:.4f}")
+
+    # Save predictions
+    predictions = outputs.argmax(dim=1)  # Get class predictions
+
+    for i, (image, mask, pred) in enumerate(zip(images, masks, predictions)):
+        # Save input image
+        input_image = to_pil_image(image.cpu())
+        input_image.save(os.path.join(results_dir, f"input_{epoch}_{batch_idx}_{i}.png"))
+
+        # Save mask
+        gt_mask = to_pil_image(mask.cpu().to(torch.uint8))  # Add channel for PIL compatibility
+        gt_mask.save(os.path.join(results_dir, f"ground_truth_{epoch}_{batch_idx}_{i}.png"))
+
+        # Save prediction
+        pred_image = to_pil_image(pred.cpu().to(torch.uint8))  # Add channel for PIL compatibility
+        pred_image.save(os.path.join(results_dir, f"prediction_{epoch}_{batch_idx}_{i}.png"))
+
+    # Print model parameters
+    print(f"Epoch {epoch + 1} parameters:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"{name}: {param.data.mean():.4f}")
+
+#present results
+
+printable_img = to_pil_image(images[0])
+printable_gt = to_pil_image(masks[0].to(torch.uint8))
+print(predictions[0].shape)
+
+printable_pred = to_pil_image(predictions[0].to(torch.uint8))
+
+plt.imshow(printable_pred)
+plt.axis('off')  # Turn off axis labels
+plt.show()
